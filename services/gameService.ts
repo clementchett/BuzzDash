@@ -1,58 +1,100 @@
-import { GameEvent, RoomData, GameState } from '../types';
-
-// We use a global channel for the demo. In a real app with this architecture, 
-// you might segregate channels by room ID to reduce noise.
-const CHANNEL_NAME = 'buzzdash_global_channel';
-const channel = new BroadcastChannel(CHANNEL_NAME);
-
-// BroadcastChannel does NOT fire onmessage for the sender (the tab that sent it).
-// We need a local listener system to 'echo' our own events back to the UI.
-const localListeners = new Set<(event: GameEvent) => void>();
-
-channel.onmessage = (msg) => {
-  const event = msg.data as GameEvent;
-  localListeners.forEach(listener => listener(event));
-};
+import { db } from './firebaseConfig';
+import { 
+  doc, 
+  onSnapshot, 
+  updateDoc, 
+  setDoc, 
+  arrayUnion, 
+  runTransaction 
+} from 'firebase/firestore';
+import { GameEvent, RoomData, GameState, Buzz } from '../types';
 
 export const gameService = {
-  // Send an event to the specific room's channel
+  // Send an event to update Firestore
   send: async (event: GameEvent) => {
     try {
-      if (!('roomId' in event.payload)) {
-        console.error("Event missing roomId", event);
-        return;
-      }
+      if (!('roomId' in event.payload)) return;
       
-      // 1. Broadcast to other tabs
-      channel.postMessage(event);
+      const roomId = event.payload.roomId;
+      const roomRef = doc(db, 'rooms', roomId);
 
-      // 2. Echo locally so the sender's UI updates too
-      // We use setTimeout to push it to the next tick, simulating async network behavior
-      setTimeout(() => {
-        localListeners.forEach(listener => listener(event));
-      }, 0);
+      switch (event.type) {
+        case 'JOIN':
+          // Add player to the players array
+          await updateDoc(roomRef, {
+            players: arrayUnion(event.payload.player)
+          });
+          break;
+
+        case 'BUZZ':
+          // Use transaction to prevent race conditions on the first buzz
+          await runTransaction(db, async (transaction) => {
+            const sfDoc = await transaction.get(roomRef);
+            if (!sfDoc.exists()) throw "Document does not exist!";
+            
+            const data = sfDoc.data() as RoomData;
+            
+            // Only accept buzz if waiting
+            if (data.gameState === GameState.WAITING) {
+              const buzz: Buzz = {
+                playerId: event.payload.playerId,
+                timestamp: event.payload.timestamp,
+                delta: data.buzzes.length === 0 ? 0 : event.payload.timestamp - data.buzzes[0].timestamp
+              };
+
+              const newBuzzes = [...data.buzzes, buzz];
+              
+              // First buzz locks the game
+              const newGameState = newBuzzes.length === 1 ? GameState.LOCKED : data.gameState;
+
+              transaction.update(roomRef, {
+                buzzes: newBuzzes,
+                gameState: newGameState
+              });
+            }
+          });
+          break;
+
+        case 'RESET':
+          await updateDoc(roomRef, {
+            gameState: GameState.WAITING,
+            buzzes: []
+          });
+          break;
+        
+        case 'SET_QUESTION':
+          await updateDoc(roomRef, {
+            currentQuestion: event.payload.question,
+            gameState: GameState.WAITING,
+            buzzes: []
+          });
+          break;
+
+        case 'SYNC_STATE':
+          // Force overwrite/init of state (mostly used by Host on creation)
+          await setDoc(roomRef, event.payload.state, { merge: true });
+          break;
+      }
 
     } catch (e) {
       console.error("Error sending event", e);
     }
   },
 
-  // Listen for events in a specific room
+  // Listen for real-time updates from Firestore
   subscribe: (roomId: string, callback: (event: GameEvent) => void) => {
-    // Wrap the callback to filter events by roomId
-    const filteredCallback = (event: GameEvent) => {
-      // Ensure we only process events for the room we are subscribed to
-      if ('payload' in event && event.payload.roomId === roomId) {
-        callback(event);
+    const unsubscribe = onSnapshot(doc(db, 'rooms', roomId), (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data() as RoomData;
+        // Emit a SYNC_STATE event so components can update their full state
+        callback({
+          type: 'SYNC_STATE',
+          payload: { roomId, state: data }
+        });
       }
-    };
+    });
 
-    localListeners.add(filteredCallback);
-
-    // Return cleanup function (unsubscribe)
-    return () => {
-      localListeners.delete(filteredCallback);
-    };
+    return unsubscribe;
   },
 
   // Helper to generate IDs

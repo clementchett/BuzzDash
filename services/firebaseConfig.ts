@@ -1,3 +1,15 @@
-// Firebase configuration has been removed in favor of BroadcastChannel for this demo.
-// This file is kept to maintain directory structure but exports nothing.
-export const db = null;
+import { initializeApp } from "firebase/app";
+import { getFirestore } from "firebase/firestore";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyCQwwtzlC5XhO6kuwPyEiiDg6-PnBk7M-c",
+  authDomain: "buzzdash-2baeb.firebaseapp.com",
+  projectId: "buzzdash-2baeb",
+  storageBucket: "buzzdash-2baeb.firebasestorage.app",
+  messagingSenderId: "587129535164",
+  appId: "1:587129535164:web:06e73085ced8ee4dfeaeb9"
+};
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+export const db = getFirestore(app);

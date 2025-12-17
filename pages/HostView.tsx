@@ -1,7 +1,7 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { gameService } from '../services/gameService';
-import { RoomData, GameState, Buzz, GameEvent } from '../types';
+import { RoomData, GameState, GameEvent } from '../types';
 import PlayerList from '../components/PlayerList';
 
 // Simple audio synth for sound effects
@@ -39,132 +39,77 @@ const HostView: React.FC = () => {
   const navigate = useNavigate();
   const [roomData, setRoomData] = useState<RoomData | null>(null);
   const [questionInput, setQuestionInput] = useState('');
+  
+  // Ref to track previous state for sound effects
+  const prevBuzzCount = useRef(0);
+  const prevGameState = useRef<GameState>(GameState.WAITING);
 
   // Initialize Room
   useEffect(() => {
     if (!roomId) return;
     
-    // Create initial state
+    // Create and save initial state if we are the first host
     const hostId = gameService.generateId();
     const initialData = gameService.getInitialRoomState(roomId, hostId);
+    
+    // Optimistic set
     setRoomData(initialData);
+
+    // Sync to Firestore (creates doc if missing)
+    gameService.send({ type: 'SYNC_STATE', payload: { roomId, state: initialData } });
 
     // Subscribe to events
     const unsubscribe = gameService.subscribe(roomId, (event: GameEvent) => {
-      // Filter events only for this room (double check, though Firestore query handles it)
       if ('payload' in event && event.payload.roomId !== roomId) return;
 
-      setRoomData(prev => {
-        if (!prev) return prev;
-        const newState = { ...prev };
-
-        switch (event.type) {
-          case 'JOIN':
-            // Add player if not exists
-            if (!newState.players.find(p => p.id === event.payload.player.id)) {
-              newState.players = [...newState.players, event.payload.player];
-              
-              // With Firestore, we don't strictly need to send SYNC_STATE immediately 
-              // because the player will replay events, but sending it helps 
-              // "checkpoint" the state for late joiners if we were implementing snapshotting.
-              // For this simple version, we'll keep the logic but it might be redundant.
-              // Actually, preventing infinite loops is good. 
-              // Let's only sync if WE are the host and we just processed a new join.
-              // Since we are in the HostView, we are the host.
-              
-              // Note: Sending SYNC_STATE after every JOIN creates a lot of traffic.
-              // The event replay handles the player's local state construction.
-              // However, the original logic relied on this for the player to know about OTHER players.
-              // Let's keep it but throttle it or rely on the fact that players also receive JOIN events.
-              // Wait, players receive JOIN events too. So they build their own list!
-              // The SYNC_STATE is mostly useful for 'late' joiners in a broadcast channel.
-              // In Firestore Event Sourcing, the late joiner gets the JOIN events too!
-              // So we can technically remove the SYNC_STATE call here, but let's leave it 
-              // to be safe with the existing architecture.
-              
-              if (prev.hostId === newState.hostId) {
-                 setTimeout(() => {
-                   gameService.send({ 
-                     type: 'SYNC_STATE', 
-                     payload: { roomId, state: newState } 
-                   });
-                 }, 500);
-              }
-            }
-            return newState;
-
-          case 'BUZZ':
-            // Only accept buzz if waiting
-            if (newState.gameState === GameState.WAITING) {
-              const firstBuzzTime = newState.buzzes.length > 0 ? newState.buzzes[0].timestamp : event.payload.timestamp;
-              const newBuzz: Buzz = {
-                playerId: event.payload.playerId,
-                timestamp: event.payload.timestamp,
-                delta: event.payload.timestamp - firstBuzzTime
-              };
-              
-              // Check if buzz already exists (deduplication)
-              if (!newState.buzzes.find(b => b.playerId === newBuzz.playerId)) {
-                 newState.buzzes = [...newState.buzzes, newBuzz];
-              }
-
-              // If it's the first buzz, lock the game
-              if (newState.buzzes.length === 1) {
-                newState.gameState = GameState.LOCKED;
-                playSound('buzz');
-                // Broadcast the new state immediately so players lock out
-                setTimeout(() => {
-                   gameService.send({ type: 'SYNC_STATE', payload: { roomId, state: newState } });
-                }, 0);
-              }
-            }
-            return newState;
+      switch (event.type) {
+        // Firestore source of truth
+        case 'SYNC_STATE':
+           setRoomData(event.payload.state as RoomData);
+           break;
+          
+        // Fallback for direct events if used in future
+        case 'JOIN':
+        case 'BUZZ':
+           // No-op: we rely on SYNC_STATE from onSnapshot for data consistency
+           break;
             
-          default:
-            return prev;
-        }
-      });
+        default:
+           break;
+      }
     });
 
     return unsubscribe;
   }, [roomId]);
 
-  // Sync state broadcast whenever roomData changes
-  // WARNING: In Firestore, this can cause infinite loops if we aren't careful.
-  // Every time we update local state from an event, we trigger this effect.
-  // If we send a SYNC_STATE, we get an event, update state, send SYNC_STATE... loop!
-  // The original BroadcastChannel logic didn't echo back to self easily, or it was filtered.
-  // With Firestore, we receive our own events.
-  // WE MUST REMOVE THIS automatic sync effect for the backend implementation 
-  // and only sync when specific actions happen (like Reset).
-  
-  /* 
+  // Handle Sound Effects based on state changes
   useEffect(() => {
-    if (roomData && roomId) {
-      gameService.send({ 
-        type: 'SYNC_STATE', 
-        payload: { roomId, state: roomData } 
-      });
+    if (!roomData) return;
+
+    // Play buzz sound if buzz count increased
+    if (roomData.buzzes.length > prevBuzzCount.current) {
+      playSound('buzz');
     }
-  }, [roomData, roomId]);
-  */
+
+    // Play reset sound if transitioning from LOCKED to WAITING (manual reset)
+    if (prevGameState.current === GameState.LOCKED && roomData.gameState === GameState.WAITING) {
+      playSound('reset');
+    }
+
+    prevBuzzCount.current = roomData.buzzes.length;
+    prevGameState.current = roomData.gameState;
+  }, [roomData]);
 
   const handleReset = useCallback(() => {
     if (!roomData || !roomId) return;
-    playSound('reset');
-    setRoomData(prev => ({
-      ...prev!,
-      gameState: GameState.WAITING,
-      buzzes: []
-    }));
+    // We don't update local state manually here to avoid desync.
+    // We send the command and wait for Firestore to update us.
     gameService.send({ type: 'RESET', payload: { roomId } });
   }, [roomData, roomId]);
 
   const handleSetQuestion = () => {
     if (!roomId) return;
-    setRoomData(prev => prev ? { ...prev, currentQuestion: questionInput } : null);
     gameService.send({ type: 'SET_QUESTION', payload: { roomId, question: questionInput } });
-    handleReset();
   };
 
   if (!roomData) return <div className="text-white p-8">Initializing Game Room...</div>;
