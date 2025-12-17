@@ -1,0 +1,5 @@
+{
+  "name": "BuzzDash",
+  "description": "A real-time quiz buzzer application allowing hosts to manage game rooms and players to buzz in. Features a simulated real-time backend via BroadcastChannel for instant testing across tabs.",
+  "requestFramePermissions": []
+}
